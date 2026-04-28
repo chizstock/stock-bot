@@ -2,42 +2,34 @@ name: Morning Stock Briefing
 
 on:
   schedule:
-    # 평일 아침 7:30 KST (UTC 22:30 전날)
-    - cron: '30 22 * * 1-5'
-  
-  # 수동 실행도 가능
-  workflow_dispatch:
+    - cron: '30 22 * * 1-5'   # 평일 07:30 KST
+  workflow_dispatch:            # 수동 실행
 
-# Node.js 24 강제 사용 (경고 해결)
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   briefing:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 30
+
     steps:
-    # 1. 코드 체크아웃 (최신 버전)
     - name: Checkout code
       uses: actions/checkout@v4
-      
-    # 2. Python 설정 (최신 버전)
+
     - name: Setup Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
-    
-    # 3. 의존성 설치
+
     - name: Install dependencies
-      run: |
-        pip install requests pandas numpy python-telegram-bot pytz
-    
-    # 4. 브리핑 실행
+      run: pip install requests
+
     - name: Run briefing
       env:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
         KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
         KIS_ACCOUNT: ${{ secrets.KIS_ACCOUNT }}
-      run: |
-        python main.py
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      run: python main.py
