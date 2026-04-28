@@ -1,8 +1,9 @@
 """
 한국투자증권 Open API + 기술적 분석 유틸리티
 GitHub Actions용 (해외 IP 대응, 환경변수 지원)
+테스트 완료: 2026-04-28 로컬 PC에서 검증
 """
-import urllib.request, urllib.error, json, datetime, statistics, time, re, os, ssl
+import urllib.request, urllib.error, json, datetime, statistics, time, os, ssl
 
 # === CONFIG ===
 APP_KEY = os.environ.get('KIS_APP_KEY', '')
@@ -29,6 +30,10 @@ PORTFOLIO = {
     '000660': {'name': 'SK하이닉스', 'qty': 30, 'avg': 984583},
 }
 
+# ETF/ETN 키워드 필터 (거래량순위에서 제외)
+ETF_KEYWORDS = ['KODEX', 'TIGER', 'RISE', 'KBSTAR', 'HANARO', 'SOL', 'KOSEF',
+                'ACE', 'ARIRANG', 'ETN', 'PLUS', '레버리지', '인버스', '선물']
+
 # === HTTP 유틸 (해외 IP 대응) ===
 COMMON_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -44,7 +49,6 @@ def _http_request(url, headers=None, data=None, method=None, max_retries=3, time
     hdrs = dict(COMMON_HEADERS)
     if headers:
         hdrs.update(headers)
-
     for attempt in range(max_retries):
         try:
             req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
@@ -52,18 +56,15 @@ def _http_request(url, headers=None, data=None, method=None, max_retries=3, time
                 return json.loads(resp.read().decode('utf-8'))
         except urllib.error.HTTPError as e:
             if e.code == 429:
-                wait = (2 ** attempt) * 3
-                print(f"  ⏳ Rate limit, {wait}초 대기...")
-                time.sleep(wait)
+                time.sleep((2 ** attempt) * 3)
             elif e.code >= 500 and attempt < max_retries - 1:
                 time.sleep(2 ** attempt)
             else:
                 raise
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
             if attempt < max_retries - 1:
-                wait = 3 * (attempt + 1)
-                print(f"  ⏳ 연결 재시도 ({attempt+1}/{max_retries}): {e}")
-                time.sleep(wait)
+                print(f"  ⏳ 재시도 ({attempt+1}/{max_retries}): {e}")
+                time.sleep(3 * (attempt + 1))
             else:
                 raise
     return None
@@ -75,8 +76,8 @@ TOKEN_FILE = "kis_token.json"
 def _load_token_from_file():
     try:
         with open(TOKEN_FILE, 'r') as f:
-            data = json.load(f)
-            return data.get("token"), data.get("expires", 0)
+            d = json.load(f)
+            return d.get("token"), d.get("expires", 0)
     except:
         return None, 0
 
@@ -92,157 +93,160 @@ def get_token():
     now = time.time()
     if _token_cache["token"] and now < _token_cache["expires"]:
         return _token_cache["token"]
-
-    file_token, file_expires = _load_token_from_file()
-    if file_token and now < file_expires:
-        _token_cache["token"] = file_token
-        _token_cache["expires"] = file_expires
-        return file_token
+    ft, fe = _load_token_from_file()
+    if ft and now < fe:
+        _token_cache["token"] = ft
+        _token_cache["expires"] = fe
+        return ft
 
     url = f"{BASE_URL}/oauth2/tokenP"
-    body = json.dumps({
-        "grant_type": "client_credentials",
-        "appkey": APP_KEY,
-        "appsecret": APP_SECRET
-    }).encode()
-
+    body = json.dumps({"grant_type": "client_credentials", "appkey": APP_KEY, "appsecret": APP_SECRET}).encode()
     for attempt in range(3):
         try:
             print(f"  🔑 토큰 발급 시도 ({attempt+1}/3)...")
-            result = _http_request(url,
-                headers={"Content-Type": "application/json"},
-                data=body, method='POST', timeout=30)
-
-            if not result or 'access_token' not in result:
-                print(f"  ❌ 토큰 응답 이상: {result}")
-                time.sleep(5)
-                continue
-
-            token = result["access_token"]
-            expires = now + 80000
-            _token_cache["token"] = token
-            _token_cache["expires"] = expires
-            _save_token_to_file(token, expires)
-            print(f"  ✅ 토큰 발급 성공")
-            return token
+            result = _http_request(url, headers={"Content-Type": "application/json"}, data=body, method='POST', timeout=30)
+            if result and 'access_token' in result:
+                token = result["access_token"]
+                expires = now + 80000
+                _token_cache["token"] = token
+                _token_cache["expires"] = expires
+                _save_token_to_file(token, expires)
+                print(f"  ✅ 토큰 발급 성공")
+                return token
+            print(f"  ❌ 응답 이상: {result}")
         except Exception as e:
-            print(f"  ❌ 토큰 발급 실패 ({attempt+1}/3): {e}")
-            if attempt < 2:
-                wait = 5 * (attempt + 1)
-                print(f"  ⏳ {wait}초 대기 후 재시도...")
-                time.sleep(wait)
-
+            print(f"  ❌ 토큰 실패 ({attempt+1}/3): {e}")
+        time.sleep(5 * (attempt + 1))
     raise Exception("한투 API 토큰 발급 3회 실패")
 
 def _kis_headers(tr_id):
-    """한투 API 공통 헤더"""
     token = get_token()
     return {
         "Content-Type": "application/json; charset=utf-8",
         "authorization": f"Bearer {token}",
-        "appkey": APP_KEY,
-        "appsecret": APP_SECRET,
+        "appkey": APP_KEY, "appsecret": APP_SECRET,
         "tr_id": tr_id,
         "User-Agent": COMMON_HEADERS['User-Agent'],
-        "Accept": "application/json",
     }
 
 def _kis_get(path, tr_id, params):
-    """한투 API GET (재시도 3회)"""
     url = f"{BASE_URL}{path}?{params}"
     hdrs = _kis_headers(tr_id)
-
     for attempt in range(3):
         try:
             req = urllib.request.Request(url, headers=hdrs)
             with urllib.request.urlopen(req, timeout=20, context=SSL_CTX) as resp:
-                body = resp.read().decode('utf-8')
-                result = json.loads(body)
-                rt_cd = result.get('rt_cd', '')
-                if rt_cd != '0':
-                    msg = result.get('msg1', 'unknown')
-                    print(f"  ⚠️ API 응답 (rt_cd={rt_cd}): {msg}")
-                    if attempt < 2:
-                        time.sleep(3 * (attempt + 1))
-                        continue
+                result = json.loads(resp.read().decode('utf-8'))
+                if result.get('rt_cd') != '0':
+                    print(f"  ⚠️ API (rt_cd={result.get('rt_cd')}): {result.get('msg1','')}")
                 return result
         except Exception as e:
-            print(f"  ❌ API 실패 ({attempt+1}/3): {e}")
             if attempt < 2:
                 time.sleep(3 * (attempt + 1))
             else:
                 raise
     return {"output": []}
 
-# === 거래량 순위 (한투 API) ===
-def _get_volume_rank_raw(market='J', price_min=0, price_max=0):
-    """거래량순위 단일 조회 (최대 30건)"""
+# === 거래량 순위 (한투 API, 검증 완료) ===
+def _is_etf(name):
+    """ETF/ETN 종목 필터"""
+    return any(kw in name for kw in ETF_KEYWORDS)
+
+def get_volume_rank_all(count=200):
+    """
+    거래량 순위 보통주 전체 수집 (코스피+코스닥 통합)
+    - tr_id: FHPST01710000
+    - FID_BLNG_CLS_CODE=3 (보통주만)
+    - 가격대 9구간 분할 → 중복제거 → 거래량순
+    - 네이버 API로 코스피/코스닥 시장 구분
+    """
+    print(f"\n  📊 거래량 순위 수집 시작 (보통주, 가격대 9구간)")
+
+    price_ranges = [
+        (0, 1000), (1000, 3000), (3000, 5000), (5000, 10000),
+        (10000, 20000), (20000, 50000), (50000, 100000),
+        (100000, 300000), (300000, 0),
+    ]
+
     path = "/uapi/domestic-stock/v1/quotations/volume-rank"
-    params = (f"FID_COND_MRKT_DIV_CODE={market}"
-              f"&FID_COND_SCR_DIV_CODE=20171"
-              f"&FID_INPUT_ISCD=0000"
-              f"&FID_DIV_CLS_CODE=0"
-              f"&FID_BLNG_CLS_CODE=0"
-              f"&FID_TRGT_CLS_CODE=111111111"
-              f"&FID_TRGT_EXLS_CLS_CODE=000000"
-              f"&FID_INPUT_PRICE_1={price_min}"
-              f"&FID_INPUT_PRICE_2={price_max}"
-              f"&FID_VOL_CNT=0"
-              f"&FID_INPUT_DATE_1=")
-    result = _kis_get(path, "FHKST130000C0", params)
-    items = result.get("output", [])
-    p_max_str = f"{price_max:,}" if price_max > 0 else "무제한"
-    print(f"    가격대 {price_min:,}~{p_max_str}: {len(items)}건")
-    return items
-
-def get_volume_rank_top(market='J', count=100):
-    """거래량 순위 상위 N개 (가격대 7구간 분할 조회)"""
-    market_name = "코스피" if market == 'J' else "코스닥"
-    print(f"\n  📊 {market_name} 거래량 순위 조회 시작")
-
-    if market == 'J':
-        price_ranges = [
-            (0, 3000), (3000, 10000), (10000, 30000), (30000, 70000),
-            (70000, 150000), (150000, 500000), (500000, 0),
-        ]
-    else:
-        price_ranges = [
-            (0, 1000), (1000, 3000), (3000, 7000), (7000, 15000),
-            (15000, 40000), (40000, 100000), (100000, 0),
-        ]
-
     all_stocks = {}
     call_count = 0
 
     for p_min, p_max in price_ranges:
         try:
             if call_count > 0:
-                print(f"    ⏳ 3초 대기...")
                 time.sleep(3)
 
-            items = _get_volume_rank_raw(market, p_min, p_max)
+            p2_str = str(p_max) if p_max > 0 else ""
+            params = ("FID_COND_MRKT_DIV_CODE=J"
+                      "&FID_COND_SCR_DIV_CODE=20171"
+                      "&FID_INPUT_ISCD=0000"
+                      "&FID_DIV_CLS_CODE=0"
+                      "&FID_BLNG_CLS_CODE=3"
+                      "&FID_TRGT_CLS_CODE=111111111"
+                      "&FID_TRGT_EXLS_CLS_CODE=0000000000"
+                      f"&FID_INPUT_PRICE_1={p_min}"
+                      f"&FID_INPUT_PRICE_2={p2_str}"
+                      "&FID_VOL_CNT="
+                      "&FID_INPUT_DATE_1=")
+
+            result = _kis_get(path, "FHPST01710000", params)
+            items = result.get("output", [])
             call_count += 1
 
+            new_count = 0
             for item in items:
                 code = str(item.get('mksc_shrn_iscd', '')).strip()
+                name = str(item.get('hts_kor_isnm', '')).strip()
                 if not code or code in all_stocks:
                     continue
+                if _is_etf(name):
+                    continue
+
                 vol_str = str(item.get('acml_vol', '0')).replace(',', '')
                 price_str = str(item.get('stck_prpr', '0')).replace(',', '')
                 all_stocks[code] = {
                     'code': code,
-                    'name': str(item.get('hts_kor_isnm', '')).strip(),
+                    'name': name,
                     'volume': int(vol_str) if vol_str.isdigit() else 0,
                     'price': int(price_str) if price_str.isdigit() else 0,
                     'change_pct': float(str(item.get('prdy_ctrt', '0')).replace(',', '') or '0'),
+                    'market': '',  # 나중에 네이버로 구분
                 }
+                new_count += 1
+
+            label = f"{p_max:,}" if p_max > 0 else "무제한"
+            print(f"    {p_min:>7,}~{label:>7}: {len(items)}건 (신규 {new_count})")
+
         except Exception as e:
             print(f"  ❌ 구간 실패: {e}")
             time.sleep(5)
 
     sorted_stocks = sorted(all_stocks.values(), key=lambda x: x['volume'], reverse=True)
-    print(f"  ✅ {market_name} 총 {len(sorted_stocks)}개 종목 수집")
-    return sorted_stocks[:count]
+    print(f"  ✅ 보통주 총 {len(sorted_stocks)}개 수집 (ETF 제외)")
+
+    # 상위 N개만 시장 구분 (네이버 API)
+    top_stocks = sorted_stocks[:count]
+    print(f"\n  📊 상위 {len(top_stocks)}개 시장 구분 중...")
+    for i, s in enumerate(top_stocks):
+        try:
+            url = f"https://m.stock.naver.com/api/stock/{s['code']}/basic"
+            data = _http_request(url)
+            if data:
+                market_name = data.get('stockExchangeType', {}).get('name', '')
+                s['market'] = 'KOSPI' if 'KOSPI' in market_name.upper() else 'KOSDAQ'
+            time.sleep(0.1)
+        except:
+            s['market'] = ''
+        if (i + 1) % 50 == 0:
+            print(f"    {i+1}/{len(top_stocks)} 완료")
+
+    kospi = [s for s in top_stocks if s['market'] == 'KOSPI']
+    kosdaq = [s for s in top_stocks if s['market'] == 'KOSDAQ']
+    unknown = [s for s in top_stocks if s['market'] == '']
+    print(f"  ✅ 코스피 {len(kospi)}개 / 코스닥 {len(kosdaq)}개 / 미분류 {len(unknown)}개")
+
+    return kospi, kosdaq
 
 # === 네이버 시세 ===
 def get_price_naver(code):
@@ -268,12 +272,10 @@ def get_price_naver(code):
         return {'code': code, 'error': str(e)}
 
 def get_price(code, source='naver'):
-    """시세 조회"""
     return get_price_naver(code)
 
 # === 일봉 차트 (네이버) ===
 def get_daily_chart_naver(code, page=1, page_size=60):
-    """네이버 일봉 차트 (페이지네이션)"""
     try:
         url = f'https://m.stock.naver.com/api/stock/{code}/price?pageSize={page_size}&page={page}'
         items = _http_request(url)
@@ -294,7 +296,6 @@ def get_daily_chart_naver(code, page=1, page_size=60):
         return []
 
 def get_daily_chart_long_naver(code, days=500):
-    """네이버 장기 일봉 (페이지네이션)"""
     all_data = []
     page = 1
     while len(all_data) < days:
@@ -308,7 +309,6 @@ def get_daily_chart_long_naver(code, days=500):
 
 # === 기술적 분석 ===
 def calc_technical(code, days=500):
-    """종목 기술적 지표 전체 계산"""
     data = get_daily_chart_long_naver(code, days)
     if len(data) < 56:
         return None
@@ -342,8 +342,6 @@ def calc_technical(code, days=500):
     if len(volumes) >= 20:
         vol_avg20 = sum(volumes[:20]) / 20
         result["vol_ratio"] = volumes[0] / vol_avg20 * 100 if vol_avg20 > 0 else 0
-        result["vol_today"] = volumes[0]
-        result["vol_avg20"] = vol_avg20
 
     if len(closes) >= 20:
         bb = closes[:20]
@@ -361,11 +359,7 @@ def calc_technical(code, days=500):
         senkou_b = (max(highs[:52]) + min(lows[:52])) / 2
         cloud_top = max(senkou_a, senkou_b)
         cloud_bottom = min(senkou_a, senkou_b)
-        result["ichimoku"] = {
-            "tenkan": tenkan, "kijun": kijun,
-            "senkou_a": senkou_a, "senkou_b": senkou_b,
-            "cloud_top": cloud_top, "cloud_bottom": cloud_bottom
-        }
+        result["ichimoku"] = {"tenkan": tenkan, "kijun": kijun, "senkou_a": senkou_a, "senkou_b": senkou_b, "cloud_top": cloud_top, "cloud_bottom": cloud_bottom}
         if closes[0] > cloud_top:
             result["cloud_position"] = "ABOVE"
         elif closes[0] < cloud_bottom:
@@ -375,9 +369,7 @@ def calc_technical(code, days=500):
 
     if len(data) >= 20:
         body_ratio = abs(closes[0] - opens[0]) / max(highs[0] - lows[0], 1)
-        is_bullish = closes[0] > opens[0]
-        vol_spike = result.get("vol_ratio", 0) > 200
-        result["power_candle"] = is_bullish and body_ratio > 0.7 and vol_spike
+        result["power_candle"] = (closes[0] > opens[0]) and body_ratio > 0.7 and result.get("vol_ratio", 0) > 200
 
     if "ma224" in result:
         result["above_ma224"] = closes[0] > result["ma224"]
@@ -387,7 +379,6 @@ def calc_technical(code, days=500):
 
 # === 단테 스코어링 ===
 def dante_score(ta):
-    """단테 밥그릇 3번 자리 점수 (필수 6 + 우대 4)"""
     if ta is None:
         return {"mandatory": 0, "bonus": 0, "total": 0, "details": []}
 
@@ -417,8 +408,7 @@ def dante_score(ta):
 
     if ta.get("gc_56_33") or ta.get("gc_112_56"):
         mandatory += 1
-        gc_type = "56>33" if ta.get("gc_56_33") else "112>56"
-        reasons.append(f"GC {gc_type}")
+        reasons.append(f"GC {'56>33' if ta.get('gc_56_33') else '112>56'}")
 
     if ta.get("power_candle"):
         mandatory += 1
@@ -437,21 +427,17 @@ def dante_score(ta):
 
 # === 텔레그램 ===
 def send_telegram(text):
-    """텔레그램 메시지 전송"""
     data = json.dumps({"chat_id": int(TELEGRAM_CHAT_ID), "text": text}).encode()
-    _http_request(
-        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-        headers={"Content-Type": "application/json"},
-        data=data, method='POST')
+    _http_request(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+        headers={"Content-Type": "application/json"}, data=data, method='POST')
 
 def send_telegram_long(text):
-    """긴 메시지 분할 전송"""
     while text:
         chunk = text[:4096]
         if len(text) > 4096:
-            last_nl = chunk.rfind('\n')
-            if last_nl > 3000:
-                chunk = text[:last_nl]
+            nl = chunk.rfind('\n')
+            if nl > 3000:
+                chunk = text[:nl]
         send_telegram(chunk)
         text = text[len(chunk):].lstrip('\n')
         if text:
@@ -459,23 +445,19 @@ def send_telegram_long(text):
 
 # === 포트폴리오 ===
 def analyze_portfolio():
-    """포트폴리오 전 종목 분석"""
     results = []
     for code, info in PORTFOLIO.items():
         try:
-            price_data = get_price_naver(code)
-            if 'error' in price_data:
-                raise Exception(price_data['error'])
-            cur_price = price_data['price']
-            pnl_pct = (cur_price - info["avg"]) / info["avg"] * 100
-            pnl_amt = (cur_price - info["avg"]) * info["qty"]
+            p = get_price_naver(code)
+            if 'error' in p:
+                raise Exception(p['error'])
+            cur = p['price']
+            pnl = (cur - info["avg"]) / info["avg"] * 100
             results.append({
-                "code": code, "name": info["name"],
-                "qty": info["qty"], "avg": info["avg"],
-                "cur_price": cur_price,
-                "change_pct": price_data.get('change_pct', 0),
-                "pnl_pct": pnl_pct, "pnl_amt": pnl_amt,
-                "volume": price_data.get('volume', 0),
+                "code": code, "name": info["name"], "qty": info["qty"], "avg": info["avg"],
+                "cur_price": cur, "change_pct": p.get('change_pct', 0),
+                "pnl_pct": pnl, "pnl_amt": (cur - info["avg"]) * info["qty"],
+                "volume": p.get('volume', 0),
             })
             time.sleep(0.15)
         except Exception as e:
