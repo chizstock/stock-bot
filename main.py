@@ -19,16 +19,28 @@ from kis_utils import (
 
 def get_scan_candidates():
     """한투 API에서 코스피/코스닥 각 거래량 TOP 100 추출"""
-    print("[1/4] 코스피 거래량 TOP 100 추출 중...")
+    print("=" * 50)
+    print("[1/4] 한투 API 거래량 순위 조회")
+    print("=" * 50)
+
     kospi = get_volume_rank_top(market='J', count=100)
-    print(f"  → 코스피 {len(kospi)}개 추출")
-    
-    time.sleep(1)
-    
-    print("[2/4] 코스닥 거래량 TOP 100 추출 중...")
+    print(f"\n  코스피: {len(kospi)}개 추출 완료")
+
+    # 코스피↔코스닥 사이 충분한 대기
+    print(f"\n  ⏳ 5초 대기 (API 안정화)...")
+    time.sleep(5)
+
     kosdaq = get_volume_rank_top(market='Q', count=100)
-    print(f"  → 코스닥 {len(kosdaq)}개 추출")
-    
+    print(f"\n  코스닥: {len(kosdaq)}개 추출 완료")
+
+    if len(kospi) == 0 and len(kosdaq) == 0:
+        print("\n  ❌ 한투 API에서 종목을 가져오지 못했습니다.")
+        print("  가능한 원인:")
+        print("    1. 해외 IP 차단 (GitHub Actions)")
+        print("    2. API 키/시크릿 오류")
+        print("    3. 장 시작 전 데이터 미갱신")
+        print("  → GitHub Secrets 설정 확인 필요")
+
     return kospi, kosdaq
 
 def scan_dante(candidates, market_name):
