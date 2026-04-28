@@ -1,192 +1,197 @@
 #!/usr/bin/env python3
 """
-주식 아침 브리핑 자동화 (GitHub Actions용)
+주식 아침 브리핑 (GitHub Actions용)
+한투 API 거래량순위 TOP100 → 네이버 차트 → 단테 스코어링
 """
-import os
-import sys
-import json
+import sys, time
 from datetime import datetime
 
-# memories 폴더 경로 추가
 sys.path.insert(0, 'memories')
 
-# 환경변수에서 API 키 읽기
-TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-KIS_APP_KEY = os.environ.get('KIS_APP_KEY')
-KIS_APP_SECRET = os.environ.get('KIS_APP_SECRET')
-KIS_ACCOUNT = os.environ.get('KIS_ACCOUNT')
-
-# kis_utils에서 함수 임포트
 from kis_utils import (
+    get_volume_rank_top,
     get_price_naver,
-    get_daily_chart_naver,
     calc_technical,
     dante_score,
     analyze_portfolio,
     send_telegram_long,
-    PORTFOLIO
 )
-def main():
-    print(f"브리핑 시작: {datetime.now()}")
-    
-    # 1. 포트폴리오 분석
-    print("포트폴리오 분석 중...")
-    portfolio_result = analyze_portfolio()
-    
-    # 2. 텔레그램 전송
-    print("텔레그램 전송 중...")
-    message = f"""📈 아침 브리핑 테스트
-    
-{portfolio_result}
 
-⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}
-🤖 GitHub Actions 자동 실행"""
+def get_scan_candidates():
+    """한투 API에서 코스피/코스닥 각 거래량 TOP 100 추출"""
+    print("[1/4] 코스피 거래량 TOP 100 추출 중...")
+    kospi = get_volume_rank_top(market='J', count=100)
+    print(f"  → 코스피 {len(kospi)}개 추출")
     
-    send_telegram_long(message)
-    print("완료!")
+    time.sleep(1)
+    
+    print("[2/4] 코스닥 거래량 TOP 100 추출 중...")
+    kosdaq = get_volume_rank_top(market='Q', count=100)
+    print(f"  → 코스닥 {len(kosdaq)}개 추출")
+    
+    return kospi, kosdaq
 
-if __name__ == "__main__":
-    main()
-def get_market_summary():
-    """시장 개요 조회"""
-    kospi = get_price_naver('KOSPI')
-    kosdaq = get_price_naver('KOSDAQ')
-    
-    lines = ["🌏 시장 개요\n"]
-    
-    if kospi:
-        emoji = "🟢" if kospi['change'] > 0 else "🔴"
-        lines.append(f"{emoji} 코스피: {kospi['price']:,} ({kospi['change']:+.2f}%)")
-    
-    if kosdaq:
-        emoji = "🟢" if kosdaq['change'] > 0 else "🔴"
-        lines.append(f"{emoji} 코스닥: {kosdaq['price']:,} ({kosdaq['change']:+.2f}%)")
-    
-    return "\n".join(lines)
-
-def scan_dante_candidates():
-    """단테 후보 스캔 (간단 버전)"""
-    # 코스피 대형주 + 코스닥 성장주 샘플
-    candidates = [
-        # 코스피
-        {'name': 'LG화학', 'code': '051910', 'type': '코스피'},
-        {'name': '포스코퓨처엠', 'code': '003670', 'type': '코스피'},
-        {'name': '신한지주', 'code': '055550', 'type': '코스피'},
-        {'name': 'NAVER', 'code': '035420', 'type': '코스피'},
-        {'name': '카카오', 'code': '035720', 'type': '코스피'},
-        {'name': '삼성SDI', 'code': '006400', 'type': '코스피'},
-        
-        # 코스닥
-        {'name': '에스티팜', 'code': '237690', 'type': '코스닥'},
-        {'name': '잉글우드랩', 'code': '950140', 'type': '코스닥'},
-        {'name': '네패스', 'code': '033640', 'type': '코스닥'},
-        {'name': '한미반도체', 'code': '042700', 'type': '코스닥'},
-    ]
-    
+def scan_dante(candidates, market_name):
+    """단테 스코어링 (네이버 차트 기반)"""
     results = []
+    total = len(candidates)
     
-    print("단테 스코어링 중...")
     for i, stock in enumerate(candidates, 1):
-        print(f"  {i}/{len(candidates)} {stock['name']} 분석 중...")
+        code = stock['code']
+        name = stock['name']
         
-        ta = calc_technical(stock['code'], days=100)
-        if not ta:
-            continue
+        if i % 10 == 0 or i == 1:
+            print(f"  [{market_name}] {i}/{total} 분석 중...")
         
-        score = dante_score(ta)
-        if not score:
-            continue
-        
-        # 필수 4점 이상만 선정
-        if score['mandatory'] >= 4:
-            results.append({
-                'name': stock['name'],
-                'code': stock['code'],
-                'type': stock['type'],
-                'price': ta['current'],
-                'change': ta['change'],
-                'score': score,
-                'ma': ta['ma']
-            })
+        try:
+            ta = calc_technical(code, days=500)
+            if not ta:
+                continue
+            
+            score = dante_score(ta)
+            
+            # 필수 3점 이상만 후보에 포함
+            if score['mandatory'] >= 3:
+                results.append({
+                    'name': name,
+                    'code': code,
+                    'price': ta['price'],
+                    'change_pct': stock.get('change_pct', 0),
+                    'volume': stock.get('volume', 0),
+                    'score': score,
+                    'ta': ta,
+                })
+            
+            time.sleep(0.15)
+        except Exception as e:
+            pass  # 개별 종목 오류는 스킵
     
     # 점수순 정렬
     results.sort(key=lambda x: x['score']['total'], reverse=True)
-    return results[:6]  # TOP 6만 반환
+    return results
 
-def format_dante_recommendations(stocks):
-    """단테 추천 종목 포맷팅"""
-    if not stocks:
-        return "🔍 단테 추천 종목: 없음 (적합한 종목 미발견)"
+def format_portfolio(data):
+    """포트폴리오 텍스트"""
+    lines = []
+    total_invested = 0
+    total_value = 0
     
-    lines = ["🔥 단테 추천 TOP 6\n"]
+    for p in data:
+        if 'error' in p:
+            lines.append(f"⚠️ {p['name']}: 조회 실패")
+            continue
+        
+        invested = p['avg'] * p['qty']
+        value = p['cur_price'] * p['qty']
+        total_invested += invested
+        total_value += value
+        
+        emoji = "🟢" if p['pnl_pct'] > 0 else "🔴" if p['pnl_pct'] < 0 else "⚪"
+        lines.append(
+            f"{emoji} {p['name']}: {p['cur_price']:,}원 ({p['change_pct']:+.2f}%) "
+            f"| 수익률 {p['pnl_pct']:+.1f}%"
+        )
     
-    for i, s in enumerate(stocks, 1):
-        sc = s['score']
-        price = s['price']
-        ma224 = s['ma'].get('224', price * 0.9)
+    if total_invested > 0:
+        total_pnl = (total_value - total_invested) / total_invested * 100
+        lines.append(f"\n💰 총 평가: {total_value:,.0f}원 ({total_pnl:+.1f}%)")
+    
+    return "\n".join(lines)
+
+def format_dante_top3(results, market_name):
+    """단테 TOP3 텍스트"""
+    top3 = results[:3]
+    
+    if not top3:
+        return f"📭 {market_name}: 필수 3점 이상 종목 없음"
+    
+    emojis = ["1️⃣", "2️⃣", "3️⃣"]
+    lines = []
+    
+    for i, item in enumerate(top3):
+        s = item['score']
+        price = item['price']
+        ta = item.get('ta', {})
+        ma224 = ta.get('ma224', price * 0.9)
         
-        # 진입가 계산
-        entry_type = "A" if price > ma224 * 1.05 else "B"
-        buy1 = int(price * 1.01)  # 1% 위
-        buy2 = int(ma224 * 1.01) if ma224 else int(price * 0.95)
-        stop = int(ma224 * 0.98) if ma224 else int(price * 0.90)
+        # 진입 타입
+        entry = "A" if ta.get('ma224_dist', 0) > 5 else "B"
         
-        emoji = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "📌"
+        # R값 계산 (진입가 - 손절가)
+        buy1 = int(price * 1.01)
+        stop = int(ma224 * 0.98) if ma224 else int(price * 0.92)
+        r_value = max(buy1 - stop, 1)
+        buy2 = stop + int(r_value * 0.3)
+        target1 = buy1 + r_value * 2  # 2R
+        target2 = buy1 + r_value * 3  # 3R
+        
+        details = ", ".join(s['details'][:4])
         
         lines.append(
-            f"{emoji} {i}. {s['name']}({s['code']}) | {s['type']}\n"
-            f"   현재가: {price:,}원 ({s['change']:+.2f}%)\n"
-            f"   점수: 필수 {sc['mandatory']}/6 + 우대 {sc['bonus']}/4 = {sc['total']}\n"
-            f"   진입{entry_type} | 1차매수: {buy1:,}원 | 2차매수: {buy2:,}원 | 손절: {stop:,}원"
+            f"{emojis[i]} {item['name']}({item['code']})\n"
+            f"   현재: {price:,}원 ({item['change_pct']:+.2f}%) "
+            f"| 필수 {s['mandatory']}/6 우대 {s['bonus']}/4\n"
+            f"   진입{entry} | 1차: {buy1:,} (30%) | 2차: {buy2:,} (70%)\n"
+            f"   손절: {stop:,} | 1차익절(2R): {int(target1):,} | 2차익절(3R): {int(target2):,}\n"
+            f"   📋 {details}"
         )
     
     return "\n\n".join(lines)
 
 def main():
-    """메인 실행"""
     now = datetime.now()
     date_str = now.strftime("%Y년 %m월 %d일")
     weekday = ["월", "화", "수", "목", "금", "토", "일"][now.weekday()]
     
-    print(f"=" * 50)
-    print(f"📈 아침 브리핑 생성: {date_str} ({weekday}요일)")
-    print(f"=" * 50)
+    print(f"{'='*50}")
+    print(f"📈 아침 브리핑: {date_str} ({weekday}요일)")
+    print(f"{'='*50}")
     
-    # 1. 헤더
-    header = f"📈 {date_str} ({weekday}요일) 아침 브리핑\n"
+    # 1. 거래량 TOP 100 추출 (한투 API)
+    kospi_candidates, kosdaq_candidates = get_scan_candidates()
     
-    # 2. 시장 개요
-    print("시장 개요 조회 중...")
-    market = get_market_summary()
+    # 2. 포트폴리오 (네이버)
+    print("\n[3/4] 포트폴리오 분석...")
+    portfolio_data = analyze_portfolio()
+    portfolio_text = format_portfolio(portfolio_data)
     
-    # 3. 포트폴리오
-    print("포트폴리오 분석 중...")
-    portfolio = analyze_portfolio()
+    # 3. 단테 스캔 (네이버 차트)
+    print(f"\n[4/4] 단테 스크리닝...")
+    print(f"  코스피 {len(kospi_candidates)}개 스캔 시작")
+    kospi_results = scan_dante(kospi_candidates, "코스피")
+    print(f"  → 코스피 필수3점+ 후보: {len(kospi_results)}개")
     
-    # 4. 단테 추천
-    print("단테 스크리닝 중...")
-    dante_stocks = scan_dante_candidates()
-    dante = format_dante_recommendations(dante_stocks)
+    print(f"  코스닥 {len(kosdaq_candidates)}개 스캔 시작")
+    kosdaq_results = scan_dante(kosdaq_candidates, "코스닥")
+    print(f"  → 코스닥 필수3점+ 후보: {len(kosdaq_results)}개")
     
-    # 5. 푸터
-    footer = f"\n⏰ 생성시간: {now.strftime('%H:%M')}\n🤖 GitHub Actions 자동 실행"
+    kospi_top = format_dante_top3(kospi_results, "코스피")
+    kosdaq_top = format_dante_top3(kosdaq_results, "코스닥")
     
-    # 조합
-    full_message = f"{header}\n{market}\n\n{portfolio}\n\n{dante}\n{footer}"
+    # 4. 메시지 조합
+    scan_info = f"코스피 {len(kospi_candidates)}개 + 코스닥 {len(kosdaq_candidates)}개 스캔"
     
-    # 6. 텔레그램 전송
-    print("텔레그램 전송 중...")
-    success = send_telegram_long(full_message)
+    msg = f"""📈 {date_str} ({weekday}요일) 아침 브리핑
+
+💼 포트폴리오 (14종목)
+{'─'*30}
+{portfolio_text}
+
+🔵 코스피 TOP3 (단테 점수순)
+{'─'*30}
+{kospi_top}
+
+🟢 코스닥 TOP3 (단테 점수순)
+{'─'*30}
+{kosdaq_top}
+
+📊 스캔 범위: 거래량 상위 {scan_info}
+⏰ {now.strftime('%H:%M')} | 🤖 GitHub Actions"""
     
-    if success:
-        print("✅ 브리핑 전송 완료!")
-    else:
-        print("❌ 브리핑 전송 실패")
-        # 콘솔에 출력
-        print("\n" + "=" * 50)
-        print(full_message)
-    
-    return success
+    # 5. 전송
+    print(f"\n텔레그램 전송 중... ({len(msg)}자)")
+    send_telegram_long(msg)
+    print("✅ 전송 완료!")
 
 if __name__ == "__main__":
     main()
