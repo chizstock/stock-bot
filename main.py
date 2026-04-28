@@ -10,6 +10,12 @@ from datetime import datetime
 # memories 폴더 경로 추가
 sys.path.insert(0, 'memories')
 
+# 환경변수에서 API 키 읽기
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
+KIS_APP_KEY = os.environ.get('KIS_APP_KEY')
+KIS_APP_SECRET = os.environ.get('KIS_APP_SECRET')
+KIS_ACCOUNT = os.environ.get('KIS_ACCOUNT')
+
 # kis_utils에서 함수 임포트
 from kis_utils import (
     get_price_naver,
@@ -20,7 +26,27 @@ from kis_utils import (
     send_telegram_long,
     PORTFOLIO
 )
+def main():
+    print(f"브리핑 시작: {datetime.now()}")
+    
+    # 1. 포트폴리오 분석
+    print("포트폴리오 분석 중...")
+    portfolio_result = analyze_portfolio()
+    
+    # 2. 텔레그램 전송
+    print("텔레그램 전송 중...")
+    message = f"""📈 아침 브리핑 테스트
+    
+{portfolio_result}
 
+⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}
+🤖 GitHub Actions 자동 실행"""
+    
+    send_telegram_long(message)
+    print("완료!")
+
+if __name__ == "__main__":
+    main()
 def get_market_summary():
     """시장 개요 조회"""
     kospi = get_price_naver('KOSPI')
