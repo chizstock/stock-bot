@@ -1,338 +1,461 @@
 """
 한국투자증권 Open API + 기술적 분석 유틸리티
-GitHub Actions용 환경변수 지원
+GitHub Actions용 (해외 IP 대응, 환경변수 지원)
 """
-import urllib.request
-import urllib.parse
-import json
-import os
-import datetime
-import statistics
-import time
+import urllib.request, urllib.error, json, datetime, statistics, time, re, os, ssl
 
-# 환경변수에서 API 키 읽기 (GitHub Actions용)
-TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+# === CONFIG ===
 APP_KEY = os.environ.get('KIS_APP_KEY', '')
 APP_SECRET = os.environ.get('KIS_APP_SECRET', '')
-ACCOUNT_NO = os.environ.get('KIS_ACCOUNT', '')
-
 BASE_URL = "https://openapi.koreainvestment.com:9443"
 
-# ============ 토큰 관리 ============
-def get_access_token():
-    """한투 API 액세스 토큰 발급"""
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '6006891840')
+
+PORTFOLIO = {
+    '034020': {'name': '두산에너빌리티', 'qty': 416, 'avg': 100441},
+    '005930': {'name': '삼성전자', 'qty': 151, 'avg': 200301},
+    '247540': {'name': '에코프로비엠', 'qty': 27, 'avg': 308555},
+    '407820': {'name': '에스피소프트', 'qty': 200, 'avg': 6070},
+    '456570': {'name': '인투셀', 'qty': 84, 'avg': 38450},
+    '086790': {'name': '하나금융지주', 'qty': 70, 'avg': 117657},
+    '064350': {'name': '현대로템', 'qty': 33, 'avg': 166600},
+    '005380': {'name': '현대차', 'qty': 10, 'avg': 516500},
+    '105560': {'name': 'KB금융', 'qty': 101, 'avg': 157692},
+    '003550': {'name': 'LG(지주)', 'qty': 51, 'avg': 98625},
+    '001120': {'name': 'LX인터내셔널', 'qty': 480, 'avg': 41401},
+    '063570': {'name': 'NICE인프라', 'qty': 300, 'avg': 4550},
+    '005490': {'name': 'POSCO홀딩스', 'qty': 15, 'avg': 543800},
+    '000660': {'name': 'SK하이닉스', 'qty': 30, 'avg': 984583},
+}
+
+# === HTTP 유틸 (해외 IP 대응) ===
+COMMON_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Accept-Encoding': 'identity',
+}
+
+# SSL 컨텍스트 (해외 서버에서 인증서 문제 방지)
+SSL_CTX = ssl.create_default_context()
+
+def _http_request(url, headers=None, data=None, method=None, max_retries=3, timeout=15):
+    """재시도 로직 포함 HTTP 요청"""
+    hdrs = dict(COMMON_HEADERS)
+    if headers:
+        hdrs.update(headers)
+    
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
+            with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as resp:
+                return json.loads(resp.read().decode('utf-8'))
+        except urllib.error.HTTPError as e:
+            if e.code == 429:  # Too Many Requests
+                wait = (2 ** attempt) * 2
+                print(f"  ⏳ Rate limit, {wait}초 대기...")
+                time.sleep(wait)
+            elif e.code >= 500 and attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+            else:
+                raise
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt
+                print(f"  ⏳ 연결 재시도 ({attempt+1}/{max_retries}): {e}")
+                time.sleep(wait)
+            else:
+                raise
+    return None
+
+# === AUTH (한투 API) ===
+_token_cache = {"token": None, "expires": 0}
+TOKEN_FILE = "kis_token.json"
+
+def _load_token_from_file():
+    try:
+        with open(TOKEN_FILE, 'r') as f:
+            data = json.load(f)
+            return data.get("token"), data.get("expires", 0)
+    except:
+        return None, 0
+
+def _save_token_to_file(token, expires):
+    try:
+        with open(TOKEN_FILE, 'w') as f:
+            json.dump({"token": token, "expires": expires}, f)
+    except:
+        pass
+
+def get_token():
+    """한투 API 토큰 (파일 캐싱 + 메모리 캐싱)"""
+    now = time.time()
+    if _token_cache["token"] and now < _token_cache["expires"]:
+        return _token_cache["token"]
+    
+    file_token, file_expires = _load_token_from_file()
+    if file_token and now < file_expires:
+        _token_cache["token"] = file_token
+        _token_cache["expires"] = file_expires
+        return file_token
+    
     url = f"{BASE_URL}/oauth2/tokenP"
-    headers = {"Content-Type": "application/json"}
-    body = {
+    body = json.dumps({
         "grant_type": "client_credentials",
         "appkey": APP_KEY,
         "appsecret": APP_SECRET
+    }).encode()
+    
+    result = _http_request(url, 
+        headers={"Content-Type": "application/json"},
+        data=body, method='POST')
+    
+    token = result["access_token"]
+    expires = now + 80000
+    _token_cache["token"] = token
+    _token_cache["expires"] = expires
+    _save_token_to_file(token, expires)
+    return token
+
+def _kis_headers(tr_id):
+    """한투 API 공통 헤더"""
+    token = get_token()
+    return {
+        "Content-Type": "application/json; charset=utf-8",
+        "authorization": f"Bearer {token}",
+        "appkey": APP_KEY,
+        "appsecret": APP_SECRET,
+        "tr_id": tr_id,
+        "User-Agent": COMMON_HEADERS['User-Agent'],
     }
-    
-    req = urllib.request.Request(
-        url, 
-        data=json.dumps(body).encode('utf-8'),
-        headers=headers,
-        method='POST'
-    )
-    
-    try:
-        with urllib.request.urlopen(req, timeout=10) as res:
-            data = json.loads(res.read().decode('utf-8'))
-            return data.get('access_token')
-    except Exception as e:
-        print(f"토큰 발급 실패: {e}")
-        return None
 
-# ============ 네이버 API (무료, 무제한) ============
+def _kis_get(path, tr_id, params):
+    """한투 API GET 요청 (재시도 포함)"""
+    url = f"{BASE_URL}{path}?{params}"
+    hdrs = _kis_headers(tr_id)
+    
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(url, headers=hdrs)
+            with urllib.request.urlopen(req, timeout=15, context=SSL_CTX) as resp:
+                return json.loads(resp.read().decode('utf-8'))
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(1 + attempt)
+            else:
+                raise
+
+# === 거래량 순위 (한투 API) ===
+def _get_volume_rank_raw(market='J', price_min=0, price_max=0):
+    """거래량순위 단일 조회 (최대 30건)"""
+    path = "/uapi/domestic-stock/v1/quotations/volume-rank"
+    params = (f"FID_COND_MRKT_DIV_CODE={market}"
+              f"&FID_COND_SCR_DIV_CODE=20171"
+              f"&FID_INPUT_ISCD=0000"
+              f"&FID_DIV_CLS_CODE=0"
+              f"&FID_BLNG_CLS_CODE=1"       # 보통주만
+              f"&FID_TRGT_CLS_CODE=111111111"
+              f"&FID_TRGT_EXLS_CLS_CODE=000000"
+              f"&FID_INPUT_PRICE_1={price_min}"
+              f"&FID_INPUT_PRICE_2={price_max}"
+              f"&FID_VOL_CNT=0"
+              f"&FID_INPUT_DATE_1=")
+    
+    result = _kis_get(path, "FHKST130000C0", params)
+    return result.get("output", [])
+
+def get_volume_rank_top(market='J', count=100):
+    """
+    거래량 순위 상위 N개 조회 (가격대별 분할 → 중복제거 → 거래량순 정렬)
+    market: J=코스피, Q=코스닥
+    """
+    if market == 'J':
+        price_ranges = [(0, 5000), (5000, 20000), (20000, 100000), (100000, 0)]
+    else:
+        price_ranges = [(0, 3000), (3000, 10000), (10000, 50000), (50000, 0)]
+    
+    all_stocks = {}
+    
+    for p_min, p_max in price_ranges:
+        try:
+            items = _get_volume_rank_raw(market, p_min, p_max)
+            for item in items:
+                code = item.get('mksc_shrn_iscd', '').strip()
+                if not code or code in all_stocks:
+                    continue
+                
+                vol_str = item.get('acml_vol', '0').replace(',', '')
+                price_str = item.get('stck_prpr', '0').replace(',', '')
+                
+                all_stocks[code] = {
+                    'code': code,
+                    'name': item.get('hts_kor_isnm', '').strip(),
+                    'volume': int(vol_str) if vol_str.isdigit() else 0,
+                    'price': int(price_str) if price_str.isdigit() else 0,
+                    'change_pct': float(item.get('prdy_ctrt', '0').replace(',', '') or '0'),
+                }
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"  ⚠️ 거래량순위 조회 실패 ({market}, {p_min}-{p_max}): {e}")
+    
+    # 거래량순 정렬 → 상위 N개
+    sorted_stocks = sorted(all_stocks.values(), key=lambda x: x['volume'], reverse=True)
+    return sorted_stocks[:count]
+
+# === 네이버 시세 (해외 IP 대응) ===
 def get_price_naver(code):
-    """네이버에서 현재가 조회"""
+    """네이버 실시간 시세 (재시도 포함)"""
     try:
-        url = f"https://m.stock.naver.com/api/stock/{code}/basic"
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0"
-        })
-        
-        with urllib.request.urlopen(req, timeout=10) as res:
-            data = json.loads(res.read().decode('utf-8'))
-            return {
-                'code': code,
-                'name': data.get('stockName', ''),
-                'price': int(data.get('closePrice', '0').replace(',', '')),
-                'change': float(data.get('fluctuationsRatio', 0)),
-                'volume': int(data.get('accumulatedTradingVolume', '0').replace(',', ''))
-            }
+        url = f'https://m.stock.naver.com/api/stock/{code}/basic'
+        result = _http_request(url)
+        return {
+            'code': code,
+            'name': result.get('stockName', ''),
+            'price': int(result.get('closePrice', '0').replace(',', '')),
+            'change': int(result.get('compareToPreviousClosePrice', '0').replace(',', '')),
+            'change_pct': float(result.get('fluctuationsRatio', 0)),
+            'open': int(result.get('openPrice', '0').replace(',', '')),
+            'high': int(result.get('highPrice', '0').replace(',', '')),
+            'low': int(result.get('lowPrice', '0').replace(',', '')),
+            'volume': int(result.get('accumulatedTradingVolume', 0)),
+            'foreign_ratio': float(result.get('foreignOwnershipRatio', 0)),
+        }
     except Exception as e:
-        print(f"네이버 시세 오류 ({code}): {e}")
-        return None
+        return {'code': code, 'error': str(e)}
 
-def get_daily_chart_naver(code, days=500):
-    """네이버에서 일봉 데이터 조회"""
+def get_price(code, source='naver'):
+    return get_price_naver(code)
+
+# === 일봉 차트 (네이버, 해외 IP 대응) ===
+def get_daily_chart_naver(code, page=1, page_size=60):
+    """네이버 일봉 차트 (페이지네이션, 재시도 포함)"""
     try:
-        end_date = datetime.datetime.now()
-        start_date = end_date - datetime.timedelta(days=days + 100)
-        
-        url = f"https://m.stock.naver.com/api/stock/{code}/price"
-        url += f"?startDate={start_date.strftime('%Y%m%d')}"
-        url += f"&endDate={end_date.strftime('%Y%m%d')}"
-        
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0"
-        })
-        
-        with urllib.request.urlopen(req, timeout=10) as res:
-            data = json.loads(res.read().decode('utf-8'))
-            chart = data.get('result', {}).get('chart', [])
-            
-            ohlcv = []
-            for item in chart:
-                ohlcv.append({
-                    'date': item.get('localTradedAt', ''),
-                    'open': int(item.get('openPrice', 0)),
-                    'high': int(item.get('highPrice', 0)),
-                    'low': int(item.get('lowPrice', 0)),
-                    'close': int(item.get('closePrice', 0)),
-                    'volume': int(item.get('accumulatedTradingVolume', 0))
-                })
-            return ohlcv[-days:] if len(ohlcv) > days else ohlcv
-            
+        url = f'https://m.stock.naver.com/api/stock/{code}/price?pageSize={page_size}&page={page}'
+        items = _http_request(url)
+        if not isinstance(items, list):
+            return []
+        result = []
+        for item in items:
+            result.append({
+                'stck_bsop_date': item['localTradedAt'].replace('-', ''),
+                'stck_oprc': item['openPrice'].replace(',', ''),
+                'stck_hgpr': item['highPrice'].replace(',', ''),
+                'stck_lwpr': item['lowPrice'].replace(',', ''),
+                'stck_clpr': item['closePrice'].replace(',', ''),
+                'acml_vol': str(item['accumulatedTradingVolume'])
+            })
+        return result
     except Exception as e:
-        print(f"네이버 차트 오류 ({code}): {e}")
         return []
 
-# ============ 기술적 분석 ============
-def calc_ma(data, period):
-    """이동평균 계산"""
-    if len(data) < period:
-        return None
-    return statistics.mean([d['close'] for d in data[-period:]])
+def get_daily_chart_long_naver(code, days=500):
+    """네이버 장기 일봉 (페이지네이션)"""
+    all_data = []
+    page = 1
+    while len(all_data) < days:
+        items = get_daily_chart_naver(code, page=page, page_size=60)
+        if not items:
+            break
+        all_data.extend(items)
+        page += 1
+        time.sleep(0.15)
+    return all_data[:days]
 
+# === 기술적 분석 ===
 def calc_technical(code, days=500):
-    """종합 기술적 분석"""
-    chart = get_daily_chart_naver(code, days)
-    if not chart or len(chart) < 60:
+    """종목의 기술적 지표 전체 계산"""
+    data = get_daily_chart_long_naver(code, days)
+    if len(data) < 56:
         return None
-    
-    current = chart[-1]
-    prev = chart[-2] if len(chart) > 1 else current
-    
-    # 이평선
-    ma5 = calc_ma(chart, 5)
-    ma20 = calc_ma(chart, 20)
-    ma33 = calc_ma(chart, 33)
-    ma56 = calc_ma(chart, 56)
-    ma112 = calc_ma(chart, 112)
-    ma224 = calc_ma(chart, 224)
-    
+
+    closes = [int(d['stck_clpr']) for d in data]
+    highs = [int(d['stck_hgpr']) for d in data]
+    lows = [int(d['stck_lwpr']) for d in data]
+    volumes = [int(d['acml_vol']) for d in data]
+    opens = [int(d['stck_oprc']) for d in data]
+
+    result = {"price": closes[0], "data_days": len(data)}
+
+    # 이동평균선
+    for period in [5, 20, 33, 56, 112, 224, 448]:
+        if len(closes) >= period:
+            result[f"ma{period}"] = sum(closes[:period]) / period
+
+    # 골든크로스
+    if "ma56" in result and "ma33" in result:
+        result["gc_56_33"] = result["ma56"] > result["ma33"]
+    if "ma112" in result and "ma56" in result:
+        result["gc_112_56"] = result["ma112"] > result["ma56"]
+
+    # 이평선 배열
+    if all(f"ma{p}" in result for p in [112, 224, 448]):
+        m112, m224, m448 = result["ma112"], result["ma224"], result["ma448"]
+        if m112 > m224 > m448:
+            result["ma_arrangement"] = "BULLISH"
+        elif m112 < m224 < m448:
+            result["ma_arrangement"] = "BEARISH"
+        else:
+            result["ma_arrangement"] = "TRANSITIONING"
+
+    # 거래량비율 (당일 vs 20일 평균)
+    if len(volumes) >= 20:
+        vol_avg20 = sum(volumes[:20]) / 20
+        result["vol_ratio"] = volumes[0] / vol_avg20 * 100 if vol_avg20 > 0 else 0
+        result["vol_today"] = volumes[0]
+        result["vol_avg20"] = vol_avg20
+
     # 볼린저밴드 (20일)
-    closes = [d['close'] for d in chart[-20:]]
-    bb_mid = statistics.mean(closes)
-    bb_std = statistics.stdev(closes) if len(closes) > 1 else 0
-    bb_upper = bb_mid + 2 * bb_std
-    bb_lower = bb_mid - 2 * bb_std
-    
-    # 거래량 분석
-    vol_avg = statistics.mean([d['volume'] for d in chart[-20:]])
-    vol_ratio = current['volume'] / vol_avg if vol_avg > 0 else 1
-    
-    return {
-        'code': code,
-        'current': current['close'],
-        'change': round((current['close'] - prev['close']) / prev['close'] * 100, 2),
-        'ma': {'5': ma5, '20': ma20, '33': ma33, '56': ma56, '112': ma112, '224': ma224},
-        'bb': {'upper': bb_upper, 'mid': bb_mid, 'lower': bb_lower},
-        'volume_ratio': round(vol_ratio, 2),
-        'chart': chart
-    }
+    if len(closes) >= 20:
+        bb = closes[:20]
+        bbm = statistics.mean(bb)
+        bbs = statistics.stdev(bb)
+        result["bb_upper"] = bbm + 2 * bbs
+        result["bb_mid"] = bbm
+        result["bb_lower"] = bbm - 2 * bbs
+        result["bb_width"] = (result["bb_upper"] - result["bb_lower"]) / bbm * 100
 
-# ============ 단테 스코어링 ============
+    # 일목균형표
+    if len(data) >= 52:
+        tenkan = (max(highs[:9]) + min(lows[:9])) / 2
+        kijun = (max(highs[:26]) + min(lows[:26])) / 2
+        senkou_a = (tenkan + kijun) / 2
+        senkou_b = (max(highs[:52]) + min(lows[:52])) / 2
+        cloud_top = max(senkou_a, senkou_b)
+        cloud_bottom = min(senkou_a, senkou_b)
+        result["ichimoku"] = {
+            "tenkan": tenkan, "kijun": kijun,
+            "senkou_a": senkou_a, "senkou_b": senkou_b,
+            "cloud_top": cloud_top, "cloud_bottom": cloud_bottom
+        }
+        if closes[0] > cloud_top:
+            result["cloud_position"] = "ABOVE"
+        elif closes[0] < cloud_bottom:
+            result["cloud_position"] = "BELOW"
+        else:
+            result["cloud_position"] = "INSIDE"
+
+    # 세력봉 감지
+    if len(data) >= 20:
+        body_ratio = abs(closes[0] - opens[0]) / max(highs[0] - lows[0], 1)
+        is_bullish = closes[0] > opens[0]
+        vol_spike = result.get("vol_ratio", 0) > 200
+        result["power_candle"] = is_bullish and body_ratio > 0.7 and vol_spike
+
+    # 224일선 대비 위치
+    if "ma224" in result:
+        result["above_ma224"] = closes[0] > result["ma224"]
+        result["ma224_dist"] = (closes[0] - result["ma224"]) / result["ma224"] * 100
+
+    return result
+
+# === 단테 스코어링 ===
 def dante_score(ta):
-    """단테 밥그릇 전략 스코어링"""
-    if not ta:
-        return None
-    
-    score = {'mandatory': 0, 'bonus': 0, 'details': []}
-    price = ta['current']
-    ma = ta['ma']
-    
-    # 필수 조건 (6개)
-    # 1. 224일선 위
-    if ma['224'] and price > ma['224']:
-        score['mandatory'] += 1
-        score['details'].append('✓ 224일선 위')
-    else:
-        score['details'].append('✗ 224일선 아래')
-    
-    # 2. 112 > 56 > 33 정배열
-    if ma['112'] and ma['56'] and ma['33']:
-        if ma['112'] > ma['56'] > ma['33']:
-            score['mandatory'] += 1
-            score['details'].append('✓ 이평선 정배열')
-        else:
-            score['details'].append('✗ 이평선 역배열')
-    
-    # 3. 5 > 20 (단기 정배열)
-    if ma['5'] and ma['20']:
-        if ma['5'] > ma['20']:
-            score['mandatory'] += 1
-            score['details'].append('✓ 단기 정배열')
-        else:
-            score['details'].append('✗ 단기 역배열')
-    
-    # 4. 볼린저밴드 중간 이상
-    if price > ta['bb']['mid']:
-        score['mandatory'] += 1
-        score['details'].append('✓ 볼린저 중간 이상')
-    else:
-        score['details'].append('✗ 볼린저 중간 아래')
-    
-    # 5. 거래량 증가
-    if ta['volume_ratio'] > 1.5:
-        score['mandatory'] += 1
-        score['details'].append(f'✓ 거래량 증가 ({ta["volume_ratio"]:.1f}배)')
-    else:
-        score['details'].append(f'✗ 거래량 부족 ({ta["volume_ratio"]:.1f}배)')
-    
-    # 6. 양봉 또는 전일 대비 상승
-    if ta['change'] > 0:
-        score['mandatory'] += 1
-        score['details'].append(f'✓ 당일 상승 ({ta["change"]:+.2f}%)')
-    else:
-        score['details'].append(f'✗ 당일 하 ({ta["change"]:+.2f}%)')
-    
-    # 우대 조건 (4개)
-    # 1. 5 > 33 (골든크로스)
-    if ma['5'] and ma['33'] and ma['5'] > ma['33']:
-        score['bonus'] += 1
-        score['details'].append('★ 5>33 GC')
-    
-    # 2. 56 > 33 (중기 GC)
-    if ma['56'] and ma['33'] and ma['56'] > ma['33']:
-        score['bonus'] += 1
-        score['details'].append('★ 56>33 GC')
-    
-    # 3. 거래량 2배 이상
-    if ta['volume_ratio'] > 2:
-        score['bonus'] += 1
-        score['details'].append(f'★ 거래량 폭발 ({ta["volume_ratio"]:.1f}배)')
-    
-    # 4. 224일선 대비 10% 이내 (진입 적기)
-    if ma['224']:
-        gap = (price - ma['224']) / ma['224'] * 100
-        if 0 < gap < 15:
-            score['bonus'] += 1
-            score['details'].append(f'★ 224선 근접 ({gap:.1f}%)')
-    
-    score['total'] = score['mandatory'] + score['bonus']
-    return score
+    """단테 밥그릇 3번 자리 점수 (필수 6 + 우대 4)"""
+    if ta is None:
+        return {"mandatory": 0, "bonus": 0, "total": 0, "details": []}
 
-# ============ 포트폴리오 ============
-PORTFOLIO = [
-    {'name': '두산에너빌리티', 'code': '034020', 'qty': 416, 'avg': 100441},
-    {'name': '삼성전자', 'code': '005930', 'qty': 151, 'avg': 200301},
-    {'name': '에코프로비엠', 'code': '247540', 'qty': 27, 'avg': 308555},
-    {'name': '에스피소프트', 'code': '407820', 'qty': 200, 'avg': 6070},
-    {'name': '인투셀', 'code': '456570', 'qty': 84, 'avg': 38450},
-    {'name': '하나금융지주', 'code': '086790', 'qty': 70, 'avg': 117657},
-    {'name': '현대로템', 'code': '079160', 'qty': 33, 'avg': 166600},
-    {'name': '현대차', 'code': '005380', 'qty': 10, 'avg': 516500},
-    {'name': 'KB금융', 'code': '105560', 'qty': 101, 'avg': 157692},
-    {'name': 'LG', 'code': '003550', 'qty': 51, 'avg': 98625},
-    {'name': 'LX인터내셔널', 'code': '001120', 'qty': 480, 'avg': 41401},
-    {'name': 'NICE인프라', 'code': '063570', 'qty': 300, 'avg': 4550},
-    {'name': 'POSCO홀딩스', 'code': '005490', 'qty': 15, 'avg': 543800},
-    {'name': 'SK하이닉스', 'code': '000660', 'qty': 30, 'avg': 984583},
-]
+    mandatory = 0
+    optional = 0
+    reasons = []
 
+    # 필수 1: 이평선 역배열→수렴/정배열 전환
+    arr = ta.get("ma_arrangement", "")
+    if arr in ("TRANSITIONING", "BULLISH"):
+        mandatory += 1
+        reasons.append(f"이평선 {arr}")
+
+    # 필수 2: 구름대 위 안착
+    if ta.get("cloud_position") == "ABOVE":
+        mandatory += 1
+        reasons.append("구름대 위 안착")
+
+    # 필수 3: 224일선 돌파/근접
+    if ta.get("above_ma224"):
+        mandatory += 1
+        reasons.append(f"224일선 돌파 ({ta.get('ma224_dist',0):.1f}%)")
+    elif ta.get("ma224_dist", -999) > -3:
+        mandatory += 1
+        reasons.append(f"224일선 근접 ({ta.get('ma224_dist',0):.1f}%)")
+
+    # 필수 4: 거래량 150%+
+    if ta.get("vol_ratio", 0) >= 150:
+        mandatory += 1
+        reasons.append(f"거래량 {ta.get('vol_ratio',0):.0f}%")
+
+    # 필수 5: 골든크로스
+    if ta.get("gc_56_33") or ta.get("gc_112_56"):
+        mandatory += 1
+        gc_type = "56>33" if ta.get("gc_56_33") else "112>56"
+        reasons.append(f"GC {gc_type}")
+
+    # 필수 6: 세력봉
+    if ta.get("power_candle"):
+        mandatory += 1
+        reasons.append("세력봉 감지")
+
+    # 우대 1: 볼밴 수렴 후 상단 돌파
+    if ta.get("bb_width", 999) < 10 and ta.get("price", 0) > ta.get("bb_upper", 999999):
+        optional += 1
+        reasons.append("볼밴 수렴 돌파")
+
+    # 우대 2: 구름대 상방 전환
+    ichi = ta.get("ichimoku", {})
+    if ichi.get("senkou_a", 0) > ichi.get("senkou_b", 0):
+        optional += 1
+        reasons.append("구름대 상방")
+
+    return {"mandatory": mandatory, "bonus": optional, "total": mandatory * 2 + optional, "details": reasons}
+
+# === 텔레그램 ===
+def send_telegram(text):
+    """텔레그램 메시지 전송 (재시도 포함)"""
+    data = json.dumps({"chat_id": int(TELEGRAM_CHAT_ID), "text": text}).encode()
+    _http_request(
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+        headers={"Content-Type": "application/json"},
+        data=data, method='POST')
+
+def send_telegram_long(text):
+    """긴 메시지 분할 전송 (4096자 제한)"""
+    while text:
+        chunk = text[:4096]
+        # 중간 잘림 방지: 줄바꿈 기준으로 자르기
+        if len(text) > 4096:
+            last_nl = chunk.rfind('\n')
+            if last_nl > 3000:
+                chunk = text[:last_nl]
+        send_telegram(chunk)
+        text = text[len(chunk):].lstrip('\n')
+        if text:
+            time.sleep(0.5)
+
+# === 포트폴리오 ===
 def analyze_portfolio():
-    """포트폴리오 분석"""
-    lines = ["📊 포트폴리오 현황\n"]
-    total_invested = 0
-    total_value = 0
-    
-    for item in PORTFOLIO:
-        info = get_price_naver(item['code'])
-        if not info:
-            lines.append(f"⚠️ {item['name']}: 조회 실패")
-            continue
-        
-        current = info['price']
-        qty = item['qty']
-        avg = item['avg']
-        
-        invested = avg * qty
-        value = current * qty
-        profit = value - invested
-        profit_pct = (current - avg) / avg * 100
-        
-        total_invested += invested
-        total_value += value
-        
-        emoji = "🟢" if profit > 0 else "🔴" if profit < 0 else "⚪"
-        lines.append(
-            f"{emoji} {item['name']}: {current:,}원 ({info['change']:+.2f}%) | "
-            f"수익률 {profit_pct:+.1f}%"
-        )
-    
-    total_profit = total_value - total_invested
-    total_profit_pct = total_profit / total_invested * 100 if total_invested > 0 else 0
-    
-    lines.append(f"\n💰 총 평가: {total_value:,}원")
-    lines.append(f"📈 총 수익: {total_profit:,}원 ({total_profit_pct:+.1f}%)")
-    
-    return "\n".join(lines)
-
-# ============ 텔레그램 ============
-def send_telegram(message):
-    """텔레그램 메시지 전송"""
-    if not TELEGRAM_BOT_TOKEN:
-        print("텔레그램 토큰 없음")
-        return False
-    
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    chat_id = "6006891840"  # 사용자 채팅 ID
-    
-    data = {
-        'chat_id': chat_id,
-        'text': message,
-        'parse_mode': 'HTML'
-    }
-    
-    try:
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(data).encode('utf-8'),
-            headers={'Content-Type': 'application/json'},
-            method='POST'
-        )
-        
-        with urllib.request.urlopen(req, timeout=10) as res:
-            result = json.loads(res.read().decode('utf-8'))
-            return result.get('ok', False)
-    except Exception as e:
-        print(f"텔레그램 전송 실패: {e}")
-        return False
-
-def send_telegram_long(message):
-    """긴 메시지 분할 전송"""
-    MAX_LEN = 4000
-    
-    if len(message) <= MAX_LEN:
-        return send_telegram(message)
-    
-    # 분할 전송
-    parts = []
-    while len(message) > MAX_LEN:
-        split_point = message.rfind('\n', 0, MAX_LEN)
-        if split_point == -1:
-            split_point = MAX_LEN
-        parts.append(message[:split_point])
-        message = message[split_point:].lstrip()
-    parts.append(message)
-    
-    for i, part in enumerate(parts, 1):
-        header = f"📄 ({i}/{len(parts)})\n" if len(parts) > 1 else ""
-        send_telegram(header + part)
-        time.sleep(0.5)
-    
-    return True
+    """포트폴리오 전 종목 실시간 분석"""
+    results = []
+    for code, info in PORTFOLIO.items():
+        try:
+            price_data = get_price_naver(code)
+            if 'error' in price_data:
+                raise Exception(price_data['error'])
+            
+            cur_price = price_data['price']
+            pnl_pct = (cur_price - info["avg"]) / info["avg"] * 100
+            pnl_amt = (cur_price - info["avg"]) * info["qty"]
+            
+            results.append({
+                "code": code,
+                "name": info["name"],
+                "qty": info["qty"],
+                "avg": info["avg"],
+                "cur_price": cur_price,
+                "change_pct": price_data.get('change_pct', 0),
+                "pnl_pct": pnl_pct,
+                "pnl_amt": pnl_amt,
+                "volume": price_data.get('volume', 0),
+            })
+            time.sleep(0.15)
+        except Exception as e:
+            results.append({"code": code, "name": info["name"], "error": str(e)})
+    return results
