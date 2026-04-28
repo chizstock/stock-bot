@@ -8,16 +8,20 @@ on:
   # 수동 실행도 가능
   workflow_dispatch:
 
+# Node.js 24 강제 사용 (경고 해결)
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   briefing:
     runs-on: ubuntu-latest
     
     steps:
-    # 1. 코드 체크아웃
+    # 1. 코드 체크아웃 (최신 버전)
     - name: Checkout code
       uses: actions/checkout@v4
-    
-    # 2. Python 설정
+      
+    # 2. Python 설정 (최신 버전)
     - name: Setup Python
       uses: actions/setup-python@v5
       with:
